@@ -14,6 +14,11 @@ import urllib.request
 import cv2
 import numpy as np
 
+from utils.motion_diagnostics import (
+    MotionDiagnostics,
+    build_motion_diagnostics,
+    format_motion_diagnostics_summary,
+)
 from utils.video import (
     get_video_info,
     iter_aligned_frames,
@@ -28,12 +33,10 @@ DEFAULT_ENDPOINT = (
 )
 DEFAULT_REQUEST_FPS = 15.0
 DEFAULT_MAX_INLINE_VIDEO_BYTES = 20 * 1024 * 1024
-DEFAULT_PROMPT = """Act as a senior animator and game QA specialist. Carefully compare the two side-by-side video clips.
-
-Ignore static image quality. Focus only on object motion, animation continuity, and timeline alignment.
-The target reproduction is on the left, and the official ground-truth reference is on the right.
-The reference motion is correct. Identify the single most severe dynamic issue in the target video, such as delayed motion, high-frequency local jitter, incorrect animation state transitions, timing drift, or temporal discontinuity.
-Describe the dynamic bug using clear production terminology."""
+DEFAULT_MOTION_DIAG_MAX_WIDTH = 1200
+DEFAULT_PROMPT_PATH = (
+    Path(__file__).resolve().parents[1] / "prompts" / "gemini_clip_difference.txt"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +65,16 @@ def parse_args() -> argparse.Namespace:
         help="Google AI Studio Gemini model name.",
     )
     parser.add_argument("--api_key", default=None, help="API key. Defaults to env or .env.")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt sent to the VLM.")
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Prompt text sent to the VLM. Overrides --prompt_file.",
+    )
+    parser.add_argument(
+        "--prompt_file",
+        default=str(DEFAULT_PROMPT_PATH),
+        help="Path to the prompt text file used when --prompt is not set.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="LLM temperature.")
     parser.add_argument("--max_tokens", type=int, default=512, help="Maximum response tokens.")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds.")
@@ -82,6 +94,22 @@ def parse_args() -> argparse.Namespace:
         "--out",
         default=None,
         help="Optional path for the generated comparison video.",
+    )
+    parser.add_argument(
+        "--no_motion_diagnostics",
+        action="store_true",
+        help="Disable optical-flow diagnostics attached to the Gemini request.",
+    )
+    parser.add_argument(
+        "--motion_diag_out",
+        default=None,
+        help="Optional path for the generated motion diagnostics PNG.",
+    )
+    parser.add_argument(
+        "--motion_diag_max_width",
+        type=int,
+        default=DEFAULT_MOTION_DIAG_MAX_WIDTH,
+        help="Maximum width of the generated motion diagnostics PNG.",
     )
     parser.add_argument(
         "--dry_run",
@@ -241,7 +269,11 @@ def assert_video_source_size(path: Path, max_bytes: int) -> None:
         )
 
 
-def call_google_ai_studio(args: argparse.Namespace, video_path: Path) -> dict:
+def call_google_ai_studio(
+    args: argparse.Namespace,
+    video_path: Path,
+    diagnostic_image_path: Path | None = None,
+) -> dict:
     api_key = args.api_key or find_api_key()
     if not api_key:
         raise RuntimeError(
@@ -253,22 +285,34 @@ def call_google_ai_studio(args: argparse.Namespace, video_path: Path) -> dict:
     model_name = urllib.parse.quote(model.removeprefix("models/"), safe="")
     endpoint = DEFAULT_ENDPOINT.format(model=model_name)
     video_b64 = base64.b64encode(video_path.read_bytes()).decode("ascii")
+    parts = [
+        {
+            "inline_data": {
+                "mime_type": "video/mp4",
+                "data": video_b64,
+            },
+            "videoMetadata": {
+                "fps": args.request_fps,
+            },
+        }
+    ]
+    if diagnostic_image_path is not None:
+        image_b64 = base64.b64encode(diagnostic_image_path.read_bytes()).decode("ascii")
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": image_b64,
+                }
+            }
+        )
+    parts.append({"text": args.prompt})
+
     payload = {
         "contents": [
             {
                 "role": "user",
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "video/mp4",
-                            "data": video_b64,
-                        },
-                        "videoMetadata": {
-                            "fps": args.request_fps,
-                        },
-                    },
-                    {"text": args.prompt},
-                ],
+                "parts": parts,
             }
         ],
         "generationConfig": {
@@ -351,6 +395,64 @@ def read_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
+def resolve_prompt(args: argparse.Namespace) -> str:
+    if args.prompt:
+        return args.prompt
+
+    prompt_path = Path(args.prompt_file).expanduser()
+    if not prompt_path.is_absolute():
+        prompt_path = Path.cwd() / prompt_path
+
+    prompt = prompt_path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError(f"prompt file is empty: {prompt_path}")
+    return prompt
+
+
+def create_motion_diagnostics(args: argparse.Namespace) -> MotionDiagnostics | None:
+    output_path = motion_diagnostics_path(args.motion_diag_out)
+    try:
+        return build_motion_diagnostics(
+            args.target,
+            args.gt,
+            start=args.start,
+            duration=args.duration,
+            fps=args.request_fps,
+            resize=args.resize,
+            output_path=output_path,
+            max_width=args.motion_diag_max_width,
+        )
+    except Exception as exc:
+        if args.motion_diag_out:
+            raise RuntimeError(f"could not create motion diagnostics: {exc}") from exc
+        print(f"warning: motion diagnostics disabled: {exc}", file=sys.stderr)
+        return None
+
+
+def motion_diagnostics_path(out_path: str | None) -> Path:
+    if out_path:
+        path = Path(out_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix="video_cmp_motion_",
+        suffix=".png",
+        delete=False,
+    )
+    handle.close()
+    return Path(handle.name)
+
+
+def append_motion_diagnostics_to_prompt(
+    prompt: str,
+    diagnostics: MotionDiagnostics | None,
+) -> str:
+    if diagnostics is None:
+        return prompt
+    return f"{prompt}\n\n{format_motion_diagnostics_summary(diagnostics)}"
+
+
 def extract_answer(response: dict) -> str:
     try:
         candidates = response["candidates"]
@@ -378,12 +480,22 @@ def main() -> None:
     args = parse_args()
     try:
         video_path = build_comparison_video(args)
+        diagnostics = None
+        if not args.no_motion_diagnostics and (not args.dry_run or args.motion_diag_out):
+            diagnostics = create_motion_diagnostics(args)
 
         if args.dry_run:
             print(str(video_path))
+            if diagnostics is not None and args.motion_diag_out:
+                print(str(diagnostics.image_path), file=sys.stderr)
             return
 
-        response = call_google_ai_studio(args, video_path)
+        args.prompt = append_motion_diagnostics_to_prompt(
+            resolve_prompt(args),
+            diagnostics,
+        )
+        diagnostic_image_path = diagnostics.image_path if diagnostics is not None else None
+        response = call_google_ai_studio(args, video_path, diagnostic_image_path)
         if args.json:
             print(json.dumps(response, ensure_ascii=False, indent=2))
             return

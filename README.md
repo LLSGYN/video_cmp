@@ -55,20 +55,32 @@ Useful options:
 - `--duration`: clip duration in seconds, default `1`.
 - `--request_fps`: generated clip FPS and Gemini video metadata FPS, default `15`.
 - `--model`: Gemini model name, default `gemini-3.1-flash-lite`.
+- `--prompt_file`: prompt text file, default `prompts/gemini_clip_difference.txt`.
+- `--prompt`: inline prompt text. Overrides `--prompt_file`.
 - `--max_video_width`: maximum width of the generated side-by-side video.
 - `--max_video_bytes`: maximum inline video size, default `20MB`.
 - `--out`: write the generated comparison MP4 to a specific path.
+- `--no_motion_diagnostics`: disable optical-flow diagnostics for the Gemini request.
+- `--motion_diag_out`: write the generated motion diagnostics PNG to a specific path.
+- `--motion_diag_max_width`: maximum width of the diagnostics PNG, default `1200`.
 - `--dry_run`: generate the MP4 without calling Gemini.
 - `--json`: print the raw Gemini response.
 
-Default prompt focus:
+Default prompt focus, stored in `prompts/gemini_clip_difference.txt`:
 
 ```text
-Ignore static image quality. Focus only on object motion, animation continuity,
-and timeline alignment. The target reproduction is on the left, and the official
-ground-truth reference is on the right. Identify the single most severe dynamic
-issue in the target video using production terminology.
+Compare the target on the left against the correct reference on the right.
+Prioritize dynamic reproduction bugs, including facial animation details such as
+eye shape, eyelid pose, gaze direction, mouth/lip-sync, expression state, hand
+gesture continuity, secondary motion, missing animation segments, and incorrect
+animation states. Do not dismiss eye or facial differences as static image
+quality.
 ```
+
+By default the Gemini request also includes a compact optical-flow diagnostics
+PNG plus a short metric summary. This is a VLM attention aid for missing,
+reduced, extra, or directionally different motion; it is not part of the global
+distance metrics.
 
 ## Global Distance
 
